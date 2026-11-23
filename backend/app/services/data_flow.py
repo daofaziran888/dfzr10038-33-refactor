@@ -11,6 +11,11 @@ import random
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from app.services.backfill_completion import (
+    SOURCE_SCHEDULE_LOAD,
+    SOURCE_WINDOW_CLOSE,
+    backfill_completion_registry,
+)
 from app.store import store
 
 # ---------------------------------------------------------------------------
@@ -98,7 +103,7 @@ def _window_compute_for_derived(
 
 
 @_register(
-    "time_window/窗口关闭 → backfill_job/启动回溯 → feature_store/启用存储 → feature_mon/启用监控",
+    "time_window/关闭窗口 → backfill_job/启动回溯 → feature_store/启用存储 → feature_mon/启用监控",
     desc="窗口关闭后发起特征回溯，回溯完成写入存储并启用监控。",
 )
 def flow_window_to_backfill_to_store_mon(time_window_id: int) -> list[FlowEffect]:
@@ -122,61 +127,65 @@ def flow_window_to_backfill_to_store_mon(time_window_id: int) -> list[FlowEffect
                 "启动回溯", "backfill_job", int(brow.get("id", 0)),
                 f"窗口 {template_no} 关闭后触发回溯任务 {brow.get('任务编号','')}",
             ))
-            # 模拟回溯完成 → 触发存储写入
-            _backfill_done_store_mon(brow, effects)
+            # 阶段一：确认回溯完成（共用明细，行数口径沿用窗口链路）
+            completion, created = _confirm_window_backfill(brow, template_no, effects)
+            if created:
+                # 阶段二：只有窗口来源紧接着把结果交给特征存储核算容量；
+                # 暂停或部分失败时保留完成明细，由重试入口继续交付。
+                _deliver_window_backfill(completion, effects)
             break
 
     return effects
 
 
-def _backfill_done_store_mon(backfill_row: dict[str, Any], effects: list[FlowEffect]):
-    """回溯完成：触发特征存储启用和监控规则检测。"""
-    backfill_row["status"] = "已完成"
-    backfill_row["pending"] = False
-    backfill_row["当前进度"] = "100%"
-
-    job_no = str(backfill_row.get("任务编号", ""))
-    target = str(backfill_row.get("目标特征", ""))
+def _confirm_window_backfill(
+    backfill_row: dict[str, Any], template_no: str, effects: list[FlowEffect]
+):
+    """窗口链路的回溯完成确认：行数口径沿用历史的随机 5万~50万行。"""
     row_count = random.randint(50000, 500000)
-    backfill_row["数据行数"] = f"{row_count}行"
+    completion, created = backfill_completion_registry.record_completion(
+        backfill_row,
+        source=SOURCE_WINDOW_CLOSE,
+        progress="100%",
+        row_count_display=f"{row_count}行",
+        source_ref=f"time_window/{template_no}",
+        source_receipt=f"窗口关闭回执:{template_no}",
+    )
+    if created:
+        effects.append(FlowEffect(
+            "回溯完成", "backfill_job", int(backfill_row.get("id", 0)),
+            f"回溯任务 {completion.job_no} 完成，产出 {completion.row_count} 行，"
+            "触发存储写入和监控检测",
+        ))
+    else:
+        effects.append(FlowEffect(
+            "回溯完成(已确认)", "backfill_job", completion.entry_id,
+            f"回溯任务 {completion.job_no} 已确认过完成，沿用首笔明细 "
+            f"{completion.row_count} 行，不重复确认",
+        ))
+    return completion, created
 
-    effects.append(FlowEffect(
-        "回溯完成", "backfill_job", int(backfill_row.get("id", 0)),
-        f"回溯任务 {job_no} 完成，产出 {row_count} 行，触发存储写入和监控检测",
-    ))
 
-    # 触发特征存储写入
-    store_rows = store.rows("feature_store")
-    for srow in store_rows:
-        if srow.get("status") == "草稿":
-            srow["status"] = "已启用"
-            srow["pending"] = True
-            srow["storage_size_gb"] = round(row_count * 0.0001, 2)
-            srow["triggered_by"] = f"backfill_job/{job_no}"
-            effects.append(FlowEffect(
-                "启用存储", "feature_store", int(srow.get("id", 0)),
-                f"回溯 {job_no} 产出 {row_count}行 触发存储配置 {srow.get('配置编号','')} 启用",
-            ))
-            break
+def _deliver_window_backfill(completion, effects: list[FlowEffect]):
+    """把窗口来源的回溯结果交付特征存储；部分失败不回滚已确认的完成明细。"""
+    try:
+        backfill_completion_registry.deliver_to_store(completion.entry_id, effects=effects)
+    except RuntimeError as exc:
+        effects.append(FlowEffect(
+            "存储交付失败", "feature_store", 0,
+            f"回溯 {completion.job_no} 完成已确认，但容量接收失败：{exc}；"
+            "可通过重试入口继续交付，行数不重算",
+        ))
+        return
 
-    # 触发特征监控检测
-    mon_rows = store.rows("feature_mon")
-    for mrow in mon_rows:
-        if mrow.get("status") == "草稿" and target in str(mrow.get("目标特征", "")):
-            mrow["status"] = "监控中"
-            mrow["pending"] = True
-            mrow["最近检测"] = datetime.date.today().isoformat()
-            mrow["触发源"] = f"backfill_job/{job_no}"
-            # 随机模拟漂移检测
-            drift = random.uniform(0, 0.15)
-            if drift > 0.1:
-                mrow["status"] = "分布漂移"
-                mrow["漂移方向"] = "正向偏移"
-            effects.append(FlowEffect(
-                "启用监控/检测漂移", "feature_mon", int(mrow.get("id", 0)),
-                f"回溯 {job_no} 完成触发监控 {mrow.get('规则编号','')} 检测，漂移={drift:.3f}",
-            ))
-            break
+    # 交付成功时补充与历史一致的「启用存储」副作用（监控检测是否命中不影响存储交付）
+    store_row = store.find("feature_store", completion.store_entry_id or 0)
+    if store_row is not None:
+        effects.append(FlowEffect(
+            "启用存储", "feature_store", int(store_row.get("id", 0)),
+            f"回溯 {completion.job_no} 产出 {completion.row_count}行 触发存储配置 "
+            f"{store_row.get('配置编号','')} 启用",
+        ))
 
 
 # ============================ 链路3: 特征存储→在线服务/离线导出 ============================
@@ -591,6 +600,7 @@ def flow_schedule_to_batch_to_backfill(schedule_job_id: int) -> list[FlowEffect]
 
     # 触发批量接入
     batch_rows = store.rows("batch_load")
+    batch_row = None
     for brow in batch_rows:
         if brow.get("status") == "待执行":
             brow["status"] = "已完成"
@@ -599,28 +609,53 @@ def flow_schedule_to_batch_to_backfill(schedule_job_id: int) -> list[FlowEffect]
             brow["拒绝行数"] = "350"
             brow["接入时间"] = datetime.datetime.now().isoformat()
             brow["triggered_by"] = f"schedule_job/{plan_no}"
+            batch_row = brow
             effects.append(FlowEffect(
                 "启动接入", "batch_load", int(brow.get("id", 0)),
                 f"调度 {plan_no}({task_type}) 激活后执行批量接入 {brow.get('任务编号','')}，接入125万行",
             ))
             break
 
-    # 触发特征回溯
+    # 触发特征回溯：编排读取原接入回执，通过共用回溯完成明细提交完成字段
     backfill_rows = store.rows("backfill_job")
     for bfrow in backfill_rows:
         if bfrow.get("status") == "待执行":
-            bfrow["status"] = "已完成"
-            bfrow["pending"] = False
-            bfrow["当前进度"] = "100%"
-            bfrow["数据行数"] = "890000行"
+            receipt = _build_load_receipt(batch_row, plan_no)
+            completion, created = backfill_completion_registry.record_completion(
+                bfrow,
+                source=SOURCE_SCHEDULE_LOAD,
+                progress="100%",
+                # 调度链路历史口径固定 89 万行，与窗口链路的随机口径相互独立
+                row_count_display="890000行",
+                source_ref=f"schedule_job/{plan_no}",
+                source_receipt=receipt,
+            )
             bfrow["triggered_by"] = f"schedule_job/{plan_no}"
-            effects.append(FlowEffect(
-                "启动回溯", "backfill_job", int(bfrow.get("id", 0)),
-                f"调度 {plan_no}({task_type}) 激活后串联回溯任务 {bfrow.get('任务编号','')}，产出89万行",
-            ))
+            if created:
+                effects.append(FlowEffect(
+                    "启动回溯", "backfill_job", int(bfrow.get("id", 0)),
+                    f"调度 {plan_no}({task_type}) 激活后串联回溯任务 "
+                    f"{bfrow.get('任务编号','')}，产出89万行",
+                ))
+            else:
+                effects.append(FlowEffect(
+                    "启动回溯(已确认)", "backfill_job", completion.entry_id,
+                    f"回溯任务 {completion.job_no} 已确认过完成，沿用首笔明细 "
+                    f"{completion.row_count} 行，不重复确认",
+                ))
             break
 
     return effects
+
+
+def _build_load_receipt(batch_row: dict[str, Any] | None, plan_no: str) -> str:
+    """读取批量接入的原接入回执，供回溯完成明细挂接来源凭证。"""
+    if batch_row is None:
+        return f"调度编排回执:{plan_no}"
+    return (
+        f"接入回执:{batch_row.get('任务编号','')};"
+        f"接入行数={batch_row.get('接入行数','')};拒绝行数={batch_row.get('拒绝行数','')}"
+    )
 
 
 # ---------------------------------------------------------------------------
